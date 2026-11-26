@@ -104,7 +104,7 @@ The app expects `expenses.db` in the project root. Create it first with `stateme
 
 ### Recommended Workflow
 
-1. **Import** — Paste bank transactions from clipboard via Settings → Import
+1. **Import** — Paste bank transactions from clipboard via Settings → Import, or load e-statement PDFs with `statement_manager.py -p` (below)
 2. **Classify with Claude API** — Use the Anthropic engine to bulk-classify transactions
 3. **Review & Correct** — Manually verify and fix any misclassifications in the Transactions tab
 4. **Train Local Model** — Once you have enough corrected data, train DistilBERT from Settings
@@ -117,6 +117,18 @@ The original command-line tools are still available:
 ```bash
 # Import from clipboard
 python statement_manager.py -d expenses.db -a
+
+# Import e-statement PDFs: single files, whole folders (every *.pdf inside), or a mix.
+# Only pages carrying the "Date of / Description / Debits / Credits" table are read,
+# so cover pages and trailing pages are ignored. Multi-line rows (foreign fee
+# breakdowns, refund details) are joined into one description with " | ", credits
+# are stored as negative amounts, and re-importing a statement is skipped as duplicates.
+python statement_manager.py -d expenses.db -p estatement.pdf
+python statement_manager.py -d expenses.db -p ~/Statements/FY2026
+python statement_manager.py -d expenses.db -c config.json -p ~/Statements --classify
+
+# Run with no arguments for the full list of examples
+python statement_manager.py
 
 # Classify with Go (concurrent) into the same 19 budget categories as the GUI.
 # Key comes from config.json {"anthropic_api_key": "..."} or, if that file is

@@ -1,6 +1,7 @@
 import re
 import sys
 import sqlite3
+import hashlib
 import argparse
 from decimal import Decimal
 from datetime import datetime
@@ -129,6 +130,140 @@ class StatementManager:
             i += 1
 
         return transactions
+
+    # ── PDF statements ──────────────────────────────────────────────────────
+    # A transaction page has a table header like:
+    #   Date of  Description   Debits  Credits (-)
+    #   Transaction
+    # Rows start with a "DD Mon YY" date and end with an amount; credits carry a
+    # trailing "-". Any deeper-indented line that follows a row (foreign fee
+    # breakdowns, merchant details on refunds) is part of that row's description.
+    _PDF_HEADER_RE = re.compile(r'Date of\s+Description\s+Debits\s+Credits', re.I)
+    _PDF_ROW_RE = re.compile(r'^(?P<indent>\s*)(?P<date>\d{2} [A-Za-z]{3} \d{2})\s+(?P<rest>.*?)\s*$')
+    _PDF_AMOUNT_RE = re.compile(
+        r'^(?P<desc>.*?)\s+(?P<amount>\d{1,3}(?:,\d{3})*\.\d{2}|\d+\.\d{2})\s*(?P<credit>-)?$')
+    # Lines that end a transaction block even without a blank line in between.
+    _PDF_STOP_RE = re.compile(r'^Page \d+ of \d+$|balance|total|continued', re.I)
+
+    @staticmethod
+    def collect_pdf_files(paths):
+        """Expand a mix of PDF files and folders into a sorted list of PDF paths."""
+        files = []
+        for raw in paths:
+            path = Path(raw).expanduser()
+            if path.is_dir():
+                found = sorted(f for f in path.iterdir()
+                               if f.is_file() and f.suffix.lower() == '.pdf')
+                if not found:
+                    print(f"Warning: no PDF files in folder {path}")
+                files.extend(found)
+            elif path.is_file():
+                files.append(path)
+            else:
+                print(f"Warning: {path} is not a file or folder, skipping")
+        return files
+
+    def parse_pdf(self, pdf_path):
+        """Parse a bank statement PDF.
+
+        Returns (transactions, pages_used). Pages without the transaction table
+        header (cover letters, points summaries, marketing) are ignored.
+        """
+        try:
+            import pdfplumber
+        except ImportError:
+            print("Error: pdfplumber is not installed. Run: pip install pdfplumber")
+            return [], []
+
+        transactions = []
+        pages_used = []
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            for page_no, page in enumerate(pdf.pages, 1):
+                text = page.extract_text(layout=True) or ""
+                if not self._PDF_HEADER_RE.search(text):
+                    continue
+                found = self._parse_pdf_page(text.splitlines())
+                if found:
+                    pages_used.append(page_no)
+                    transactions.extend(found)
+
+        self._assign_pdf_references(transactions)
+        return transactions, pages_used
+
+    def _parse_pdf_page(self, lines):
+        """Parse the transaction table on one page of layout-preserved text."""
+        # Skip everything up to and including the two-line table header.
+        start = 0
+        for i, line in enumerate(lines):
+            if self._PDF_HEADER_RE.search(line):
+                start = i + 1
+                break
+        if lines[start:start + 1] and lines[start].strip().lower() == 'transaction':
+            start += 1
+
+        transactions = []
+        current = None
+        current_indent = 0
+
+        for line in lines[start:]:
+            stripped = line.strip()
+            if not stripped:
+                current = None
+                continue
+
+            row = self._PDF_ROW_RE.match(line)
+            if row:
+                current = None
+                amount_match = self._PDF_AMOUNT_RE.match(row.group('rest'))
+                if not amount_match:
+                    print(f"  Warning: no amount on line, skipped: {stripped[:60]}")
+                    continue
+                try:
+                    date_obj = datetime.strptime(row.group('date'), '%d %b %y')
+                except ValueError:
+                    print(f"  Warning: bad date on line, skipped: {stripped[:60]}")
+                    continue
+
+                amount = float(amount_match.group('amount').replace(',', ''))
+                if amount_match.group('credit'):
+                    amount = -amount
+
+                current = {
+                    'date': date_obj.strftime('%Y-%m-%d'),
+                    'description': self._collapse_ws(amount_match.group('desc')),
+                    'reference': '',
+                    'amount': amount,
+                }
+                current_indent = len(row.group('indent'))
+                transactions.append(current)
+                continue
+
+            # Continuation line: deeper indent than the date column, no date.
+            indent = len(line) - len(line.lstrip())
+            if (current is not None and indent > current_indent
+                    and not self._PDF_STOP_RE.search(stripped)):
+                current['description'] += ' | ' + self._collapse_ws(stripped)
+            else:
+                current = None
+
+        return transactions
+
+    @staticmethod
+    def _collapse_ws(text):
+        return re.sub(r'\s+', ' ', text).strip()
+
+    @staticmethod
+    def _assign_pdf_references(transactions):
+        """Statements carry no card reference number, but the table's unique
+        key needs one. Derive a stable hash from the row content plus its
+        occurrence count, so re-importing the same statement is detected as a
+        duplicate while two identical purchases on one day both survive."""
+        seen = {}
+        for txn in transactions:
+            key = (txn['date'], txn['description'], f"{txn['amount']:.2f}")
+            seen[key] = seen.get(key, 0) + 1
+            digest = hashlib.sha1('|'.join(key + (str(seen[key]),)).encode('utf-8')).hexdigest()
+            txn['reference'] = f"pdf-{digest[:12]}"
 
     def classify_transaction(self, description: str, amount: float):
         """Use Claude API to classify a transaction"""
@@ -315,19 +450,57 @@ def main():
         description='Credit Card Statement Manager with AI Classification (Cross-platform)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  # Add transactions from clipboard
-  python statement_manager.py -d statements.db -a
+Sources:
+  Clipboard (-a): in your bank's web portal, select and copy the credit card
+    transaction rows. Each row should start with a DDMMYY date and end with
+    the amount; the card reference number may sit on the following line.
+  PDF (-p): e-statement PDFs. Pass files, folders (all *.pdf inside), or a
+    mix. Only pages with the "Date of / Description / Debits / Credits"
+    table are read; cover pages, points summaries and trailing pages are
+    skipped. Multi-line rows (foreign fee breakdowns, refund details) are
+    joined into one description. Credits are stored as negative amounts.
+  Duplicates (same date, reference and amount) are skipped automatically,
+  so re-importing a statement is safe.
 
-  # Add with AI classification
-  python statement_manager.py -d statements.db -c config.json -a --classify
+Examples (run inside the project environment: `uv run ...` or
+`.venv/bin/python ...`; a bare `python3` is the system interpreter and
+will not have the dependencies installed):
+  # Add transactions from clipboard (no AI)
+  uv run statement_manager.py -d statements.db -a
 
-  # Export to Excel
-  python statement_manager.py -d statements.db -e expenses.xlsx
+  # Import one PDF statement
+  uv run statement_manager.py -d statements.db -p estatement.pdf
 
-  # Add with AI and export
-  python statement_manager.py -d statements.db -c config.json -a --classify -e expenses.xlsx
-        """
+  # Import every PDF in a folder, plus one more file
+  uv run statement_manager.py -d statements.db -p ~/Statements/2026 extra.pdf
+
+  # Import PDFs and classify with Claude for tax purposes
+  uv run statement_manager.py -d statements.db -c config.json -p ~/Statements --classify
+
+  # Export everything to an Excel workbook (one worksheet per month)
+  uv run statement_manager.py -d statements.db -e expenses.xlsx
+
+  # Full round: import, classify and export in one go
+  uv run statement_manager.py -d statements.db -c config.json -p ~/Statements --classify -e expenses.xlsx
+
+  # Keep a database per financial year
+  uv run statement_manager.py -d fy2026.db -p ~/Statements/FY2026
+  uv run statement_manager.py -d fy2026.db -e fy2026_expenses.xlsx
+
+config.json format (keep this file out of version control):
+  {"anthropic_api_key": "sk-ant-..."}
+
+Categories used by --classify:
+  software, professional membership, technical library,
+  magazines and journals, training, not work related, other
+
+Excel export notes:
+  - Column A holds the database ID so edits can be synced back
+    (see excel_to_db_sync.py).
+  - AI-classified rows are marked with a robot emoji in the Category column.
+  - The Category column has a dropdown so manual fixes stay valid.
+
+Running with no arguments prints this help."""
     )
 
     parser.add_argument('-d', '--database', required=True,
@@ -336,49 +509,81 @@ Examples:
                         help='Path to config file (JSON with anthropic_api_key)')
     parser.add_argument('-a', '--add', action='store_true',
                         help='Add transactions from clipboard to database')
+    parser.add_argument('-p', '--pdf', nargs='+', metavar='PATH',
+                        help='Add transactions from PDF statement file(s) and/or folder(s)')
     parser.add_argument('--classify', action='store_true',
-                        help='Use AI to classify transactions (requires -c and -a)')
+                        help='Use AI to classify transactions (requires -c and -a/-p)')
     parser.add_argument('-e', '--export',
                         help='Export database to Excel file')
+
+    # No arguments: show the full help with examples instead of a terse error.
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(0)
 
     args = parser.parse_args()
 
     # Validate arguments
-    if args.classify and not args.add:
-        print("Error: --classify requires -a (add) flag")
+    if args.classify and not (args.add or args.pdf):
+        print("Error: --classify requires -a (clipboard) or -p (PDF)")
         sys.exit(1)
 
     if args.classify and not args.config:
         print("Error: --classify requires -c (config) flag with API key")
         sys.exit(1)
 
+    if not (args.add or args.pdf or args.export):
+        parser.print_usage()
+        print("Error: nothing to do. Use -a, -p and/or -e.")
+        sys.exit(1)
+
     # Initialize manager
     manager = StatementManager(args.database, args.config)
 
     try:
-        # Add transactions if requested
+        transactions = []
+
         if args.add:
             print("Parsing clipboard data...")
-            transactions = manager.parse_clipboard()
-
-            if not transactions:
+            found = manager.parse_clipboard()
+            if not found:
                 print("No valid transactions found in clipboard")
             else:
-                print(f"Found {len(transactions)} transactions\n")
+                print(f"Found {len(found)} transactions in clipboard")
+                transactions.extend(found)
 
-                if args.classify:
-                    print("AI Classification enabled...")
+        if args.pdf:
+            pdf_files = StatementManager.collect_pdf_files(args.pdf)
+            if not pdf_files:
+                print("No PDF files to process")
+            for pdf_file in pdf_files:
+                print(f"Parsing {pdf_file}...")
+                found, pages = manager.parse_pdf(pdf_file)
+                if found:
+                    page_list = ", ".join(str(p) for p in pages)
+                    print(f"  Found {len(found)} transactions on page(s) {page_list}")
+                    transactions.extend(found)
+                else:
+                    print("  No transaction pages found")
 
-                added, duplicates = manager.add_transactions(transactions, use_ai=args.classify)
+        if transactions:
+            print(f"\nAdding {len(transactions)} transactions to database")
+            if args.classify:
+                print("AI Classification enabled...")
 
-                print(f"\n✓ Added {added} new transactions")
+            added, duplicates = manager.add_transactions(transactions, use_ai=args.classify)
 
-                if duplicates:
-                    print(f"\n⚠️  Found {len(duplicates)} duplicate(s):")
-                    for dup in duplicates:
-                        print(f"  {dup['date']} - {dup['description'][:50]} - ${dup['amount']}")
-                    print("\nDuplicate transactions were not added to the database.")
+            print(f"\n✓ Added {added} new transactions")
+
+            if duplicates:
+                print(f"\n⚠️  Found {len(duplicates)} duplicate(s):")
+                for dup in duplicates:
+                    print(f"  {dup['date']} - {dup['description'][:50]} - ${dup['amount']}")
+                print("\nDuplicate transactions were not added to the database.")
+                if not args.export:
                     sys.exit(1)
+        elif args.add or args.pdf:
+            print("\nNothing to add")
 
         # Export to Excel if requested
         if args.export:
