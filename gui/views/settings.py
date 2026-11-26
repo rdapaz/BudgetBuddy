@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea, QFrame,
     QPushButton, QProgressBar, QTextEdit, QMessageBox, QSizePolicy,
     QGridLayout, QGroupBox, QRadioButton, QLineEdit, QButtonGroup,
-    QComboBox, QSpinBox,
+    QComboBox, QSpinBox, QCheckBox, QFileDialog,
 )
 
 from gui.models.database import BudgetDatabase
@@ -21,6 +21,8 @@ from gui.models.api_key import (
 )
 from gui.workers.classify_worker import ClassifyAPIWorker, ClassifyLocalWorker
 from gui.workers.train_worker import TrainWorker
+from gui.workers.pdf_import_worker import PdfImportWorker
+from gui.models.pdf_statement import format_pages
 from gui.categories import CATEGORIES, get_groups, get_classification_prompt
 from gui.theme import (
     font_heading, font_body, BG_MAIN, BG_CARD, BORDER, NAVY, ACCENT,
@@ -33,6 +35,7 @@ from gui.widgets.help_window import make_help_button as _help_button
 ENGINE_KEY = "classify_engine"   # "api" or "local"
 ENGINE_API = "api"
 ENGINE_LOCAL = "local"
+PDF_DIR_KEY = "pdf_import_dir"   # last folder used for PDF import
 
 
 class SettingsView(QWidget):
@@ -43,6 +46,7 @@ class SettingsView(QWidget):
         self.db = db
         self.worker = None
         self.train_worker = None
+        self.pdf_worker = None
         self._last_import_ids: list[int] = []
         self._build_ui()
         self.refresh()
@@ -229,9 +233,11 @@ class SettingsView(QWidget):
         import_layout.addLayout(import_title_row)
 
         import_desc = QLabel(
-            "Copy your credit card statement to the clipboard, then click Import. "
-            "Transactions are parsed from the standard 6-digit date format "
-            "(DDMMYY) used by Australian bank statements."
+            "Import from the clipboard (copy your statement text; rows use the 6-digit "
+            "DDMMYY date format) or from e-statement PDFs (pick files or a whole folder). "
+            "Only PDF pages with the transaction table are read, multi-line rows are "
+            "joined into one description, and credits are stored as negative amounts. "
+            "Duplicates are skipped either way."
         )
         import_desc.setFont(font_body(10))
         import_desc.setStyleSheet(f"color: {TEXT_SECONDARY}; background: transparent; border: none;")
@@ -269,6 +275,50 @@ class SettingsView(QWidget):
 
         btn_row.addStretch()
         import_layout.addLayout(btn_row)
+
+        pdf_btn_style = f"""
+            QPushButton {{
+                background-color: #4E79A7; color: white; border: none;
+                border-radius: 8px; padding: 8px 20px; font-size: 10pt; font-weight: 600;
+            }}
+            QPushButton:hover {{ background-color: #3D6290; }}
+            QPushButton:disabled {{ background-color: #9CA3AF; }}
+        """
+
+        pdf_row = QHBoxLayout()
+
+        self.import_pdf_btn = QPushButton("Import PDF Files…")
+        self.import_pdf_btn.setFixedHeight(38)
+        self.import_pdf_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.import_pdf_btn.setToolTip("Pick one or more e-statement PDFs")
+        self.import_pdf_btn.setStyleSheet(pdf_btn_style)
+        self.import_pdf_btn.clicked.connect(self._import_pdf_files)
+        pdf_row.addWidget(self.import_pdf_btn)
+
+        self.import_pdf_folder_btn = QPushButton("Import PDF Folder…")
+        self.import_pdf_folder_btn.setFixedHeight(38)
+        self.import_pdf_folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.import_pdf_folder_btn.setToolTip("Import every PDF in a folder")
+        self.import_pdf_folder_btn.setStyleSheet(pdf_btn_style)
+        self.import_pdf_folder_btn.clicked.connect(self._import_pdf_folder)
+        pdf_row.addWidget(self.import_pdf_folder_btn)
+
+        self.pdf_auto_classify = QCheckBox("Auto-classify after PDF import")
+        self.pdf_auto_classify.setFont(font_body(10))
+        self.pdf_auto_classify.setStyleSheet(f"""
+            QCheckBox {{ color: {TEXT_PRIMARY}; background: transparent; spacing: 8px; }}
+            QCheckBox::indicator {{
+                width: 16px; height: 16px; border: 1px solid #9CA3AF;
+                border-radius: 4px; background: white;
+            }}
+            QCheckBox::indicator:hover {{ border-color: {ACCENT}; }}
+            QCheckBox::indicator:checked {{ background-color: {NAVY}; border-color: {NAVY}; }}
+        """)
+        self.pdf_auto_classify.setToolTip("Classify the newly imported rows using the selected engine")
+        pdf_row.addWidget(self.pdf_auto_classify)
+
+        pdf_row.addStretch()
+        import_layout.addLayout(pdf_row)
 
         self.import_result = QLabel()
         self.import_result.setFont(font_body(10))
@@ -1173,6 +1223,99 @@ class SettingsView(QWidget):
                                     "Expected format: DDMMYY followed by description and amount.")
             return
 
+        self._store_transactions(transactions, auto_classify)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  PDF IMPORT
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _pdf_start_dir(self) -> str:
+        saved = self.db.get_setting(PDF_DIR_KEY)
+        if saved and Path(saved).is_dir():
+            return saved
+        return str(Path.home())
+
+    def _import_pdf_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select PDF statements", self._pdf_start_dir(),
+            "PDF statements (*.pdf *.PDF);;All files (*)"
+        )
+        if paths:
+            self._import_pdf_paths(paths)
+
+    def _import_pdf_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select a folder of PDF statements", self._pdf_start_dir()
+        )
+        if folder:
+            self._import_pdf_paths([folder])
+
+    def _import_pdf_paths(self, paths: list):
+        """Parse the given PDF files/folders in the background, then store them."""
+        if self.pdf_worker and self.pdf_worker.isRunning():
+            return
+
+        first = Path(paths[0])
+        self.db.set_setting(PDF_DIR_KEY, str(first if first.is_dir() else first.parent))
+
+        self._set_import_buttons_enabled(False)
+        self.classify_last_btn.setVisible(False)
+        self.import_result.setVisible(True)
+        self.import_result.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; background: transparent; border: none;"
+        )
+        self.import_result.setText("Reading PDF statements…")
+
+        self.pdf_worker = PdfImportWorker(paths, self)
+        self.pdf_worker.progress.connect(self._on_pdf_progress)
+        self.pdf_worker.finished.connect(self._on_pdf_finished)
+        self.pdf_worker.start()
+
+    def _on_pdf_progress(self, current: int, total: int, name: str):
+        self.import_result.setText(f"Reading {name} ({current} of {total})…")
+
+    def _on_pdf_finished(self, results: list, messages: list):
+        self._set_import_buttons_enabled(True)
+
+        transactions = [t for _, txns, _ in results for t in txns]
+        lines = []
+        for name, txns, pages in results:
+            if txns:
+                plural = "s" if len(pages) != 1 else ""
+                lines.append(f"{name}: {len(txns)} transactions on page{plural} {format_pages(pages)}")
+            else:
+                lines.append(f"{name}: no transaction pages found")
+        lines.extend(messages)
+
+        if not transactions:
+            self.import_result.setText("No transactions found in the selected PDFs.")
+            self.import_result.setStyleSheet(
+                f"color: {NEGATIVE}; background: transparent; border: none; font-weight: 600;"
+            )
+            QMessageBox.information(
+                self, "No Transactions Found",
+                "No transaction pages were found in the selected PDFs.\n\n" + "\n".join(lines)
+            )
+            return
+
+        self._store_transactions(
+            transactions,
+            auto_classify=self.pdf_auto_classify.isChecked(),
+            detail="\n".join(lines),
+        )
+
+    def _set_import_buttons_enabled(self, enabled: bool):
+        for btn in (self.import_btn, self.import_classify_btn,
+                    self.import_pdf_btn, self.import_pdf_folder_btn):
+            btn.setEnabled(enabled)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  SHARED: STORE PARSED TRANSACTIONS
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _store_transactions(self, transactions: list, auto_classify: bool = False,
+                            detail: str = ""):
+        """Insert parsed transactions (clipboard or PDF), report, and optionally classify."""
         conn = sqlite3.connect(self.db.db_path)
         cursor = conn.cursor()
         added = 0
@@ -1200,6 +1343,8 @@ class SettingsView(QWidget):
         msg = f"Imported {added} new transaction{'s' if added != 1 else ''}"
         if duplicates:
             msg += f" ({duplicates} duplicate{'s' if duplicates != 1 else ''} skipped)"
+        if detail:
+            msg += "\n" + detail
         self.import_result.setText(msg)
         self.import_result.setStyleSheet(
             f"color: {POSITIVE if added > 0 else TEXT_SECONDARY}; "

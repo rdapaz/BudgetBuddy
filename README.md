@@ -104,7 +104,7 @@ The app expects `expenses.db` in the project root. Create it first with `stateme
 
 ### Recommended Workflow
 
-1. **Import** — Paste bank transactions from clipboard via Settings → Import, or load e-statement PDFs with `statement_manager.py -p` (below)
+1. **Import** — In Settings → Import Transactions, paste bank transactions from the clipboard or pick e-statement PDF files / a folder of them (the CLI equivalent is `statement_manager.py -p`, below)
 2. **Classify with Claude API** — Use the Anthropic engine to bulk-classify transactions
 3. **Review & Correct** — Manually verify and fix any misclassifications in the Transactions tab
 4. **Train Local Model** — Once you have enough corrected data, train DistilBERT from Settings
@@ -164,7 +164,8 @@ BudgetBuddy/
 │   ├── help.md                 # Built-in help documentation
 │   ├── models/
 │   │   ├── database.py         # SQLite data access layer
-│   │   └── api_key.py          # Keyring-based API key management
+│   │   ├── api_key.py          # Keyring-based API key management
+│   │   └── pdf_statement.py    # e-statement PDF parser (GUI + CLI)
 │   ├── views/
 │   │   ├── dashboard.py        # Monthly spending overview
 │   │   ├── transactions.py     # Transaction list with search/export
@@ -177,6 +178,7 @@ BudgetBuddy/
 │   │   └── help_window.py      # Help dialog with HTML rendering
 │   └── workers/
 │       ├── classify_worker.py  # API + Local classification threads
+│       ├── pdf_import_worker.py # Background PDF statement reader
 │       └── train_worker.py     # DistilBERT training thread
 ├── statement_manager.py        # Legacy CLI import/export
 ├── classifier.go               # Go concurrent classifier, budget + legacy tax modes (go build -o classifier .)

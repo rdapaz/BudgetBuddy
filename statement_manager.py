@@ -1,7 +1,6 @@
 import re
 import sys
 import sqlite3
-import hashlib
 import argparse
 from decimal import Decimal
 from datetime import datetime
@@ -132,138 +131,25 @@ class StatementManager:
         return transactions
 
     # ── PDF statements ──────────────────────────────────────────────────────
-    # A transaction page has a table header like:
-    #   Date of  Description   Debits  Credits (-)
-    #   Transaction
-    # Rows start with a "DD Mon YY" date and end with an amount; credits carry a
-    # trailing "-". Any deeper-indented line that follows a row (foreign fee
-    # breakdowns, merchant details on refunds) is part of that row's description.
-    _PDF_HEADER_RE = re.compile(r'Date of\s+Description\s+Debits\s+Credits', re.I)
-    _PDF_ROW_RE = re.compile(r'^(?P<indent>\s*)(?P<date>\d{2} [A-Za-z]{3} \d{2})\s+(?P<rest>.*?)\s*$')
-    _PDF_AMOUNT_RE = re.compile(
-        r'^(?P<desc>.*?)\s+(?P<amount>\d{1,3}(?:,\d{3})*\.\d{2}|\d+\.\d{2})\s*(?P<credit>-)?$')
-    # Lines that end a transaction block even without a blank line in between.
-    _PDF_STOP_RE = re.compile(r'^Page \d+ of \d+$|balance|total|continued', re.I)
+    # Parsing lives in gui/models/pdf_statement.py so the GUI's Settings ->
+    # Import and this CLI read statements identically.
 
     @staticmethod
     def collect_pdf_files(paths):
         """Expand a mix of PDF files and folders into a sorted list of PDF paths."""
-        files = []
-        for raw in paths:
-            path = Path(raw).expanduser()
-            if path.is_dir():
-                found = sorted(f for f in path.iterdir()
-                               if f.is_file() and f.suffix.lower() == '.pdf')
-                if not found:
-                    print(f"Warning: no PDF files in folder {path}")
-                files.extend(found)
-            elif path.is_file():
-                files.append(path)
-            else:
-                print(f"Warning: {path} is not a file or folder, skipping")
-        return files
+        from gui.models.pdf_statement import collect_pdf_files
+        return collect_pdf_files(paths, warn=lambda m: print(f"Warning: {m}"))
 
     def parse_pdf(self, pdf_path):
-        """Parse a bank statement PDF.
-
-        Returns (transactions, pages_used). Pages without the transaction table
-        header (cover letters, points summaries, marketing) are ignored.
-        """
+        """Parse a bank statement PDF. Returns (transactions, pages_used)."""
         try:
-            import pdfplumber
-        except ImportError:
-            print("Error: pdfplumber is not installed. Run: pip install pdfplumber")
+            from gui.models.pdf_statement import parse_pdf
+            return parse_pdf(pdf_path, warn=lambda m: print(f"  Warning: {m}"))
+        except ImportError as e:
+            print(f"Error: {e}")
+            if 'pdfplumber' in str(e):
+                print("Run: uv sync  (or pip install pdfplumber)")
             return [], []
-
-        transactions = []
-        pages_used = []
-        with pdfplumber.open(str(pdf_path)) as pdf:
-            for page_no, page in enumerate(pdf.pages, 1):
-                text = page.extract_text(layout=True) or ""
-                if not self._PDF_HEADER_RE.search(text):
-                    continue
-                found = self._parse_pdf_page(text.splitlines())
-                if found:
-                    pages_used.append(page_no)
-                    transactions.extend(found)
-
-        self._assign_pdf_references(transactions)
-        return transactions, pages_used
-
-    def _parse_pdf_page(self, lines):
-        """Parse the transaction table on one page of layout-preserved text."""
-        # Skip everything up to and including the two-line table header.
-        start = 0
-        for i, line in enumerate(lines):
-            if self._PDF_HEADER_RE.search(line):
-                start = i + 1
-                break
-        if lines[start:start + 1] and lines[start].strip().lower() == 'transaction':
-            start += 1
-
-        transactions = []
-        current = None
-        current_indent = 0
-
-        for line in lines[start:]:
-            stripped = line.strip()
-            if not stripped:
-                current = None
-                continue
-
-            row = self._PDF_ROW_RE.match(line)
-            if row:
-                current = None
-                amount_match = self._PDF_AMOUNT_RE.match(row.group('rest'))
-                if not amount_match:
-                    print(f"  Warning: no amount on line, skipped: {stripped[:60]}")
-                    continue
-                try:
-                    date_obj = datetime.strptime(row.group('date'), '%d %b %y')
-                except ValueError:
-                    print(f"  Warning: bad date on line, skipped: {stripped[:60]}")
-                    continue
-
-                amount = float(amount_match.group('amount').replace(',', ''))
-                if amount_match.group('credit'):
-                    amount = -amount
-
-                current = {
-                    'date': date_obj.strftime('%Y-%m-%d'),
-                    'description': self._collapse_ws(amount_match.group('desc')),
-                    'reference': '',
-                    'amount': amount,
-                }
-                current_indent = len(row.group('indent'))
-                transactions.append(current)
-                continue
-
-            # Continuation line: deeper indent than the date column, no date.
-            indent = len(line) - len(line.lstrip())
-            if (current is not None and indent > current_indent
-                    and not self._PDF_STOP_RE.search(stripped)):
-                current['description'] += ' | ' + self._collapse_ws(stripped)
-            else:
-                current = None
-
-        return transactions
-
-    @staticmethod
-    def _collapse_ws(text):
-        return re.sub(r'\s+', ' ', text).strip()
-
-    @staticmethod
-    def _assign_pdf_references(transactions):
-        """Statements carry no card reference number, but the table's unique
-        key needs one. Derive a stable hash from the row content plus its
-        occurrence count, so re-importing the same statement is detected as a
-        duplicate while two identical purchases on one day both survive."""
-        seen = {}
-        for txn in transactions:
-            key = (txn['date'], txn['description'], f"{txn['amount']:.2f}")
-            seen[key] = seen.get(key, 0) + 1
-            digest = hashlib.sha1('|'.join(key + (str(seen[key]),)).encode('utf-8')).hexdigest()
-            txn['reference'] = f"pdf-{digest[:12]}"
 
     def classify_transaction(self, description: str, amount: float):
         """Use Claude API to classify a transaction"""

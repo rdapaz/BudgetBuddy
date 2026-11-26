@@ -39,9 +39,11 @@ Import transactions by copying your bank/credit card statement text to the clipb
 080325 SHELL COLES EXPRESS MARRI 62.30
 ```
 
-**Import** — Adds transactions to the database. Duplicates (same date, reference, amount) are automatically skipped.
+**Import from Clipboard** — Adds transactions to the database. Duplicates (same date, reference, amount) are automatically skipped.
 
-**Import + Auto-Classify** — Imports and immediately classifies using whichever engine is selected above.
+**Import + Auto-Classify** — Imports from the clipboard and immediately classifies using whichever engine is selected above.
+
+**Import PDF Files… / Import PDF Folder…** — Reads e-statement PDFs directly. Pick one or more files, or a folder (every PDF inside it is read). Only pages carrying the "Date of / Description / Debits / Credits" table are used, so cover pages, points summaries and trailing pages are ignored. Rows that span several lines (foreign-currency fee breakdowns, refund details) are joined into one description with ` | `, and credits are stored as negative amounts. Re-importing a statement is safe: its rows are detected as duplicates. Tick **Auto-classify after PDF import** to classify the new rows straight away. The command-line equivalent is `statement_manager.py -p`.
 
 **Classify Last Import** — Appears after an import. Classifies only the newly imported transactions (useful when catching up on multiple months).
 
