@@ -156,12 +156,17 @@ Context: This is for an OT cybersecurity professional in industrial control syst
 Respond with ONLY the category name in lowercase, nothing else."""
 
             message = self.client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=50,
-                messages=[{"role": "user", "content": prompt}]
+                model="claude-sonnet-5-5",
+                max_tokens=256,
+                messages=[{"role": "user", "content": prompt}],
+                # Thinking is on by default on this model; keep it minimal for a
+                # one-word answer. extra_body because the pinned SDK predates output_config.
+                extra_body={"output_config": {"effort": "low"}},
             )
 
-            category = message.content[0].text.strip().strip('"').lower()
+            # Read by block type, not position: the first block may be a thinking block.
+            text = next((b.text for b in message.content if b.type == "text"), "")
+            category = text.strip().strip('"').lower()
 
             # Validate category
             if category in self.categories:

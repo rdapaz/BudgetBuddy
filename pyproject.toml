@@ -1,13 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "TaxationTools"
-version = "0.1.0"
-description = "Credit card statement manager with AI classification"
-requires-python = ">=3.8"
+name = "budgetbuddy"
+version = "2.0.0"
+description = "PySide6 desktop budgeting app with AI transaction classification"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
 dependencies = [
-    "pyperclip>=1.8.2",
-    "openpyxl>=3.1.0",
     "anthropic>=0.40.0",
     "keyring>=25.0.0",
+    "matplotlib>=3.7.0",
+    "numpy>=1.24.0",
+    "openpyxl>=3.1.0",
+    "pandas>=2.0.0",
+    "pyperclip>=1.8.2",
+    "PySide6>=6.5.0",
+    "scikit-learn>=1.3.0",
+    "torch>=2.0.0",
+    "transformers>=4.30.0",
 ]
 
-# Remove the build-system section entirely
+[project.scripts]
+budgetbuddy = "budgetbuddy:main"
+
+[tool.setuptools]
+# Flat layout: the GUI package plus the standalone CLI scripts at the repo root.
+packages = [
+    "gui",
+    "gui.models",
+    "gui.views",
+    "gui.widgets",
+    "gui.workers",
+]
+py-modules = [
+    "budgetbuddy",
+    "statement_manager",
+    "excel_to_db_sync",
+    "excel_to_processed_table",
+    "expense_classifier_trainer",
+    "expense_classifier_predictor",
+]
+
+[tool.setuptools.package-data]
+gui = ["help.md"]

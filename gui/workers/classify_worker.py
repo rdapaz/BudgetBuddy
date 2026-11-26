@@ -16,6 +16,13 @@ from PySide6.QtCore import QThread, Signal
 from gui.models.database import BudgetDatabase
 from gui.categories import CATEGORIES, get_classification_prompt
 
+# Current Sonnet. Thinking is on by default on this model, so replies are read by
+# block type (not position) and max_tokens leaves room for it. Effort "low" keeps
+# thinking minimal for a one-word classification; it is sent via extra_body because
+# the pinned anthropic SDK predates the output_config parameter.
+CLAUDE_MODEL = "claude-sonnet-5-5"
+CLAUDE_EXTRA_BODY = {"output_config": {"effort": "low"}}
+
 
 class ClassifyAPIWorker(QThread):
     """Background worker that uses Claude API to classify uncategorised transactions."""
@@ -94,12 +101,14 @@ Amount: ${amount:.2f}
 Respond with ONLY the category id (e.g. "groceries"), nothing else."""
 
                     message = client.messages.create(
-                        model="claude-sonnet-4-20250514",
-                        max_tokens=30,
-                        messages=[{"role": "user", "content": prompt}]
+                        model=CLAUDE_MODEL,
+                        max_tokens=256,
+                        messages=[{"role": "user", "content": prompt}],
+                        extra_body=CLAUDE_EXTRA_BODY,
                     )
 
-                    category = message.content[0].text.strip().strip('"').lower()
+                    text = next((b.text for b in message.content if b.type == "text"), "")
+                    category = text.strip().strip('"').lower()
 
                     if category not in CATEGORIES:
                         self.log.emit(f"  Invalid category '{category}' for: {desc[:40]}... -> other")

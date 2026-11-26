@@ -1,6 +1,6 @@
 module statement-classifier
 
-go 1.20
+go 1.21
 
 require (
 	github.com/anthropics/anthropic-sdk-go v0.2.0-alpha.6

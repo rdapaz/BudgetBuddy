@@ -16,7 +16,8 @@ A polished PySide6 desktop application for Australian household budgeting. Impor
 - **Settings** — Classification engine configuration, data import, model training, and data coverage overview
 
 ### AI Classification (Dual Engine)
-- **Anthropic Claude API** — Cloud-based classification using `claude-sonnet-4-20250514` with batch processing
+- **Anthropic Claude API** — Cloud-based classification using `claude-sonnet-5-5` with batch processing
+- **Go CLI classifier** — Same categories and prompt as the GUI engine, with concurrent workers for bulk runs (`classifier.go`)
 - **Local DistilBERT Model** — Train your own model from corrected data for free, offline classification
 - **Smart Fallback** — If the selected engine is unavailable, automatically falls back to the other
 - Toggle between engines from Settings with a single click
@@ -49,16 +50,38 @@ A polished PySide6 desktop application for Australian household budgeting. Impor
 ## Installation
 
 ### Prerequisites
-- Python 3.10+
-- pip
+- Python 3.10+ (tested on 3.14)
+- [uv](https://docs.astral.sh/uv/) or pip
+- Go 1.21+ and a C compiler (only for the legacy Go classifier — `go-sqlite3` uses cgo; on macOS run `xcode-select --install`)
 
-### Setup
+### Setup (Python)
 
 ```bash
 git clone https://github.com/rdapaz/BudgetBuddy.git
 cd BudgetBuddy
-pip install -e .
+
+# Option A: uv (recommended)
+uv venv .venv
+uv pip install -r requirements.txt
+
+# Option B: pip
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
 ```
+
+`pip install -e .` also works and additionally installs a `budgetbuddy` console command.
+
+> The first install downloads PyTorch (several hundred MB). If `uv` times out, retry with `UV_HTTP_TIMEOUT=600`.
+
+### Setup (Go classifier)
+
+```bash
+go build -o classifier .
+./classifier -h
+```
+
+`go run classifier.go ...` also works without a build step.
 
 ### Key Dependencies
 - `PySide6` — Qt GUI framework
@@ -74,8 +97,10 @@ pip install -e .
 ### Launch the App
 
 ```bash
-python budgetbuddy.py
+.venv/bin/python budgetbuddy.py      # or: source .venv/bin/activate && python budgetbuddy.py
 ```
+
+The app expects `expenses.db` in the project root. Create it first with `statement_manager.py` (see below) if it doesn't exist.
 
 ### Recommended Workflow
 
@@ -93,8 +118,17 @@ The original command-line tools are still available:
 # Import from clipboard
 python statement_manager.py -d expenses.db -a
 
-# Classify with Go (concurrent)
-go run classifier.go -d expenses.db -c config.json -w 10
+# Classify with Go (concurrent) into the same 19 budget categories as the GUI.
+# Key comes from config.json {"anthropic_api_key": "..."} or, if that file is
+# absent, from $ANTHROPIC_API_KEY. Writes budget_category, same column the GUI uses.
+go run classifier.go -d expenses.db -w 10
+# or, after `go build -o classifier .`:
+./classifier -d expenses.db -w 10 --dry-run     # preview without writing
+./classifier -list                              # print the category list
+./classifier -mode tax -d expenses.db           # legacy tax-deduction categories
+
+# Sync corrections from an edited Excel export back into the database
+python excel_to_db_sync.py -i expenses.xlsx -d expenses.db --dry-run
 
 # Export to Excel
 python statement_manager.py -d expenses.db -e expenses.xlsx
@@ -133,10 +167,13 @@ BudgetBuddy/
 │       ├── classify_worker.py  # API + Local classification threads
 │       └── train_worker.py     # DistilBERT training thread
 ├── statement_manager.py        # Legacy CLI import/export
-├── classifier.go               # Legacy Go concurrent classifier
+├── classifier.go               # Go concurrent classifier, budget + legacy tax modes (go build -o classifier .)
+├── excel_to_db_sync.py         # Push Excel edits back into SQLite
+├── excel_to_processed_table.py # Load Excel into the processed table
 ├── expense_classifier_trainer.py   # Legacy CLI trainer
 ├── expense_classifier_predictor.py # Legacy CLI predictor
-└── pyproject.toml
+├── pyproject.toml              # Package metadata (pip install -e .)
+└── requirements.txt            # Pinned-minimum runtime deps
 ```
 
 ## Configuration
